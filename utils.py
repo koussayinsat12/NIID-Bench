@@ -169,8 +169,7 @@ def record_net_data_stats(y_train, net_dataidx_map, logdir):
 
     for net_i, dataidx in net_dataidx_map.items():
         unq, unq_cnt = np.unique(y_train[dataidx], return_counts=True)
-        tmp = {unq[i]: unq_cnt[i] for i in range(len(unq))}
-        net_cls_counts[net_i] = tmp
+        net_cls_counts[net_i] = {int(unq[i]): int(unq_cnt[i]) for i in range(len(unq))}
 
     logger.info('Data statistics: %s' % str(net_cls_counts))
 
@@ -850,4 +849,128 @@ def noise_sample(choice, n_dis_c, dis_c_dim, n_con_c, n_z, batch_size, device):
 
     return noise, idx
 
+def set_client_from_params(mdl, params, device, exclude_bn=False, exclude_classifier=False, set_grad_params=False, set_non_grad_params=False):
+    """
+    Set model parameters from a flattened parameter tensor.
+    
+    Args:
+        mdl: PyTorch model
+        params: Flattened tensor of parameters
+        device: Target device for parameters
+        exclude_bn: If True, exclude batch norm parameters
+        set_grad_params: If True, only set parameters requiring gradient
+        set_non_grad_params: If True, only set parameters not requiring gradient
+    
+    Returns:
+        Updated model
+    """
+    def param_filter(name):
+        
+        if exclude_classifier and name.startswith("classifier"):
+            return True
+        
+        if exclude_bn and any(x in name for x in ['bn', 'running_mean', 'running_var', 'num_batches_tracked']):
+            return True
+        if set_grad_params:
+            orig_param = dict(mdl.named_parameters()).get(name, None)
+            if orig_param is None or not orig_param.requires_grad:
+                return True
+        if set_non_grad_params:
+            orig_param = dict(mdl.named_parameters()).get(name, None)
+            if orig_param is not None:
+                return True
+        return False
+    
+    dict_param = copy.deepcopy(mdl.state_dict())
+    idx = 0
+    
+    for name, param in mdl.state_dict().items():
+        if param_filter(name):
+            continue
+        weights = param.data
+        length = weights.numel()
+        try:
+            dict_param[name].data.copy_(
+                params[idx:idx+length].reshape(weights.shape).to(device=device, dtype=weights.dtype)
+            )
+            idx += length
+        except Exception as e:
+            raise ValueError(f"Error setting parameter {name}: {str(e)}")
+    
+    mdl.load_state_dict(dict_param)
+    return mdl
 
+def get_mdl_params(model_list, exclude_bn=False, n_par=None, device="cpu", get_grad_params=False, get_non_grad_params=False, exclude_classifier=False):
+    """
+    Extract flattened parameters (and optionally buffers) from models.
+
+    Args:
+        model_list: List of models
+        exclude_bn: Exclude BN parameters and buffers
+        n_par: Expected parameter count
+        device: Target device
+        get_grad_params: Include only grad params
+        get_non_grad_params: Include only non-grad params
+
+    Returns:
+        torch.Tensor: (N_models, n_par) flattened param matrix
+    """
+    def param_filter(name):
+        
+        if exclude_classifier and name.startswith("classifier"):
+            return True
+        
+        if exclude_bn and any(x in name for x in ['bn', 'running_mean', 'running_var', 'num_batches_tracked']):
+            return True
+        if get_grad_params:
+            orig_param = dict(model_list[0].named_parameters()).get(name, None)
+            if orig_param is None or not orig_param.requires_grad:
+                return True
+        if get_non_grad_params:
+            orig_param = dict(model_list[0].named_parameters()).get(name, None)
+            if orig_param is not None:
+                return True
+        return False
+
+    if not model_list:
+        raise ValueError("model_list cannot be empty")
+
+    if n_par is None:
+        n_par = 0
+        for name, param in model_list[0].state_dict().items():
+            if not param_filter(name):
+                n_par += param.numel()
+
+    param_mat = np.zeros((len(model_list), n_par), dtype=np.float32)
+
+    for i, model in enumerate(model_list):
+        idx = 0
+        for name, param in model.state_dict().items():
+            if param_filter(name):
+                continue
+            
+            #print(name)
+            
+            flat_param = param.data.cpu().numpy().flatten()
+            if idx + len(flat_param) > n_par:
+                raise ValueError(f"Too many parameters in model {i} at {name}")
+            param_mat[i, idx:idx + len(flat_param)] = flat_param
+            idx += len(flat_param)
+
+    return torch.tensor(param_mat, dtype=torch.float32, device=device)
+
+def conjugate_gradient(A, b, x0, tol=1e-6, max_iter=5):
+        x = x0
+        r = b - A * x
+        d = r
+        for _ in range(max_iter):
+            Ad = A * d  # Replace with A @ d if needed
+            alpha = torch.dot(r, r) / torch.dot(d, Ad)
+            x = x + alpha * d
+            r_new = r - alpha * Ad
+            if torch.norm(r_new) < tol:
+                break
+            beta = torch.dot(r_new, r_new) / torch.dot(r, r)
+            d = r_new + beta * d
+            r = r_new
+        return x

@@ -14,24 +14,34 @@ import copy
 from math import *
 import random
 
-import datetime
+from datetime import datetime
 #from torch.utils.tensorboard import SummaryWriter
-
+import copy
+import logging
+import sys
+import wandb
 from model import *
 from utils import *
 from vggmodel import *
 from resnetcifar import *
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setFormatter(formatter)
+logger.addHandler(stdout_handler)
+
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='mlp', help='neural network used in training')
-    parser.add_argument('--dataset', type=str, default='mnist', help='dataset used for training')
+    parser.add_argument('--model', type=str, default='simple-cnn', help='neural network used in training')
+    parser.add_argument('--dataset', type=str, default='cifar10', help='dataset used for training')
     parser.add_argument('--net_config', type=lambda x: list(map(int, x.split(', '))))
-    parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
+    parser.add_argument('--partition', type=str, default='noniid-labeldir', help='the data partitioning strategy')
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
     parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=2,  help='number of workers in a distributed cluster')
+    parser.add_argument('--n_parties', type=int, default=10,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
                             help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon')
     parser.add_argument('--use_projection_head', type=bool, default=False, help='whether add an additional header to model or not (see MOON)')
@@ -46,7 +56,7 @@ def get_args():
     parser.add_argument('--reg', type=float, default=1e-5, help="L2 regularization strength")
     parser.add_argument('--logdir', type=str, required=False, default="./logs/", help='Log directory path')
     parser.add_argument('--modeldir', type=str, required=False, default="./models/", help='Model directory path')
-    parser.add_argument('--beta', type=float, default=0.5, help='The parameter for the dirichlet distribution for data partitioning')
+    parser.add_argument('--beta', type=float, default=0.01, help='The parameter for the dirichlet distribution for data partitioning')
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
     parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
@@ -797,36 +807,63 @@ if __name__ == '__main__':
     args = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
-    if args.log_file_name is None:
-        argument_path='experiment_arguments-%s.json' % datetime.datetime.now().strftime("%Y-%m-%d-%H:%M-%S")
-    else:
-        argument_path=args.log_file_name+'.json'
-    with open(os.path.join(args.logdir, argument_path), 'w') as f:
-        json.dump(str(args), f)
-    device = torch.device(args.device)
-    # logging.basicConfig(filename='test.log', level=logger.info, filemode='w')
-    # logging.info("test")
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
+    
+    now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    
+    dataset_logdir = os.path.join(args.logdir, args.dataset)
+    mkdirs(dataset_logdir)
 
-    if args.log_file_name is None:
-        args.log_file_name = 'experiment_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H:%M-%S"))
-    log_path=args.log_file_name+'.log'
-    logging.basicConfig(
-        filename=os.path.join(args.logdir, log_path),
-        # filename='/home/qinbin/test.log',
-        format='%(asctime)s %(levelname)-8s %(message)s',
-        datefmt='%m-%d %H:%M', level=logging.DEBUG, filemode='w')
+    # Log file name with full path
+    args.log_file_name = os.path.join(
+        dataset_logdir,
+        f"experiment_{args.alg}_{args.dataset}_{args.partition}_{now}.log"
+    )
+    
+    wandb.init(
+    project="fl-benchmark",  # Change to your preferred project name
+    entity="kousai",
+    name=f"{args.alg}_{args.dataset}_{args.partition}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    config=vars(args)
+    )
 
+    wandb.define_metric("round")
+    wandb.define_metric("Train Accuracy", step_metric="round", summary="max")
+    wandb.define_metric("Test Accuracy", step_metric="round", summary="max")
+    wandb.log({"algorithm start" : args.alg})
+    
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
+
+    file_handler = logging.FileHandler(args.log_file_name, mode='w')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter('%(message)s')
+    console_handler.setFormatter(console_formatter)
+    logger.addHandler(console_handler)
+
+    device = torch.device(args.device)
     logger.info(device)
+    
+
 
     seed = args.init_seed
     logger.info("#" * 100)
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
+    
+    logger.info("Starting Experiment...")
+    logger.info(f"Algorithm: {args.alg}")
+    logger.info(f"Dataset: {args.dataset}")
+
+    
+    
+    
     logger.info("Partitioning data")
     X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
         args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
@@ -838,7 +875,7 @@ if __name__ == '__main__':
                                                                                         args.batch_size,
                                                                                         32)
 
-    print("len train_dl_global:", len(train_ds_global))
+    logger.info(f"len train_dl_global : {len(train_dl_global)}")
 
 
     data_size = len(test_ds_global)
@@ -880,15 +917,15 @@ if __name__ == '__main__':
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
 
-        for round in range(args.comm_round):
-            logger.info("in comm round:" + str(round))
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
 
             arr = np.arange(args.n_parties)
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
 
             global_para = global_model.state_dict()
-            if round == 0:
+            if cm_round == 0:
                 if args.is_same_initial:
                     for idx in selected:
                         nets[idx].load_state_dict(global_para)
@@ -923,7 +960,13 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
-
+            
+            
+            wandb.log({
+                            "Train Accuracy": train_acc,
+                            "Test Accuracy": test_acc,
+                            "round": cm_round
+                        })
 
     elif args.alg == 'fedprox':
         logger.info("Initializing nets")
@@ -937,15 +980,15 @@ if __name__ == '__main__':
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
 
-        for round in range(args.comm_round):
-            logger.info("in comm round:" + str(round))
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
 
             arr = np.arange(args.n_parties)
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
 
             global_para = global_model.state_dict()
-            if round == 0:
+            if cm_round == 0:
                 if args.is_same_initial:
                     for idx in selected:
                         nets[idx].load_state_dict(global_para)
@@ -982,6 +1025,13 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            
+            
+            wandb.log({
+                            "Train Accuracy": train_acc,
+                            "Test Accuracy": test_acc,
+                            "round": cm_round
+                        })
 
     elif args.alg == 'scaffold':
         logger.info("Initializing nets")
@@ -1002,15 +1052,15 @@ if __name__ == '__main__':
                 net.load_state_dict(global_para)
 
 
-        for round in range(args.comm_round):
-            logger.info("in comm round:" + str(round))
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
 
             arr = np.arange(args.n_parties)
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
 
             global_para = global_model.state_dict()
-            if round == 0:
+            if cm_round == 0:
                 if args.is_same_initial:
                     for idx in selected:
                         nets[idx].load_state_dict(global_para)
@@ -1045,6 +1095,13 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            
+            
+            wandb.log({
+                        "Train Accuracy": train_acc,
+                        "Test Accuracy": test_acc,
+                        "round": cm_round
+                        })
 
     elif args.alg == 'fednova':
         logger.info("Initializing nets")
@@ -1072,15 +1129,15 @@ if __name__ == '__main__':
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
 
-        for round in range(args.comm_round):
-            logger.info("in comm round:" + str(round))
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
 
             arr = np.arange(args.n_parties)
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
 
             global_para = global_model.state_dict()
-            if round == 0:
+            if cm_round == 0:
                 if args.is_same_initial:
                     for idx in selected:
                         nets[idx].load_state_dict(global_para)
@@ -1138,6 +1195,12 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            
+            wandb.log({
+                            "Train Accuracy": train_acc,
+                            "Test Accuracy": test_acc,
+                            "round": cm_round
+                        })
 
     elif args.alg == 'moon':
         logger.info("Initializing nets")
@@ -1157,15 +1220,15 @@ if __name__ == '__main__':
             for param in net.parameters():
                 param.requires_grad = False
 
-        for round in range(args.comm_round):
-            logger.info("in comm round:" + str(round))
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
 
             arr = np.arange(args.n_parties)
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
 
             global_para = global_model.state_dict()
-            if round == 0:
+            if cm_round == 0:
                 if args.is_same_initial:
                     for idx in selected:
                         nets[idx].load_state_dict(global_para)
@@ -1174,7 +1237,7 @@ if __name__ == '__main__':
                     nets[idx].load_state_dict(global_para)
 
             local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, global_model=global_model,
-                                 prev_model_pool=old_nets_pool, round=round, device=device)
+                                 prev_model_pool=old_nets_pool, round=cm_round, device=device)
             # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
 
             # update global model
@@ -1211,7 +1274,91 @@ if __name__ == '__main__':
                 old_nets_pool.append(old_nets)
             else:
                 old_nets_pool[0] = old_nets
+                
+            wandb.log({
+                            "Train Accuracy": train_acc,
+                            "Test Accuracy": test_acc,
+                            "round": cm_round
+                        })
+            
+            
+        
+    elif args.alg=='fedcg':
+        logger.info("Initializing nets")
+        
+        nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
+        global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
+        global_model = global_models[0]
 
+        global_para = global_model.state_dict()
+        if args.is_same_initial:
+            for net_id, net in nets.items():
+                net.load_state_dict(global_para)
+
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
+
+            arr = np.arange(args.n_parties)
+            np.random.shuffle(arr)
+            selected = arr[:int(args.n_parties * args.sample)]
+
+            global_para = global_model.state_dict()
+            if cm_round == 0:
+                if args.is_same_initial:
+                    for idx in selected:
+                        nets[idx].load_state_dict(global_para)
+            else:
+                for idx in selected:
+                    nets[idx].load_state_dict(global_para)
+
+            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+
+            cld_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]
+            n_par = len(get_mdl_params([global_model], exclude_bn=False, device=args.device)[0])
+
+            A = 0
+            b = 0
+            
+            for idx in range(len(selected)):
+                
+                #### get model params
+                curr_model_par = get_mdl_params([nets[idx]], exclude_bn=False, n_par=n_par, device=args.device)[0]
+                
+                ### calculate drfit
+                drift_norm = torch.norm(cld_model_params - curr_model_par, p=2)
+                
+                ### calculate b
+                b += drift_norm * curr_model_par
+                
+                ### calculate A
+                A += drift_norm
+                
+            ### get model parameters
+            cld_model_params = conjugate_gradient(A=A, b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
+            
+            global_model = set_client_from_params(mdl=global_model, params=cld_model_params, exclude_bn=False, device=self.args.device)
+            
+            
+            logger.info('global n_training: %d' % len(train_dl_global))
+            logger.info('global n_test: %d' % len(test_dl_global))
+
+            global_model.to(device)
+            train_acc = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
+
+
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            
+            
+            wandb.log({
+                        "Train Accuracy": train_acc,
+                        "Test Accuracy": test_acc,
+                        "round":cm_round
+                        })
+    
+    
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
