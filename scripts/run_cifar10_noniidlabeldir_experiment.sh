@@ -17,7 +17,7 @@ do
     for alg in fedcg fedavg scaffold fednova
     do
         run_and_control_parallelism python experiments.py --model=simple-cnn \
-            --dataset=femnist \
+            --dataset=cifar10 \
             --alg=$alg \
             --lr=0.01 \
             --batch-size=64 \
@@ -27,7 +27,7 @@ do
             --comm_round=50 \
             --partition=noniid-labeldir \
             --beta=$beta \
-            --device='cpu' \
+            --device='cuda:0' \
             --datadir='./data/' \
             --logdir='./logs/' \
             --noise=0 \

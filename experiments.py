@@ -48,7 +48,7 @@ def get_args():
     parser.add_argument('--out_dim', type=int, default=256, help='the output dimension for the projection layer')
     parser.add_argument('--loss', type=str, default='contrastive', help='for moon')
     parser.add_argument('--temperature', type=float, default=0.5, help='the temperature parameter for contrastive loss')
-    parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
+    parser.add_argument('--comm_round', type=int, default=200, help='number of maximum communication roun')
     parser.add_argument('--is_same_initial', type=int, default=1, help='Whether initial all the models with the same parameters in fedavg')
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
     parser.add_argument('--dropout_p', type=float, required=False, default=0.0, help="Dropout probability. Default=0.0")
@@ -1320,13 +1320,17 @@ if __name__ == '__main__':
             A = 0
             b = 0
             
+            total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
+
+            
             for idx in range(len(selected)):
                 
                 #### get model params
                 curr_model_par = get_mdl_params([nets[idx]], exclude_bn=False, n_par=n_par, device=args.device)[0]
                 
                 ### calculate drfit
-                drift_norm = torch.norm(cld_model_params - curr_model_par, p=2)
+                drift_norm = torch.abs(cld_model_params - curr_model_par) + 1e-6
                 
                 ### calculate b
                 b += drift_norm * curr_model_par
@@ -1337,7 +1341,7 @@ if __name__ == '__main__':
             ### get model parameters
             cld_model_params = conjugate_gradient(A=A, b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
             
-            global_model = set_client_from_params(mdl=global_model, params=cld_model_params, exclude_bn=False, device=self.args.device)
+            global_model = set_client_from_params(mdl=global_model, params=cld_model_params, exclude_bn=False, device=args.device)
             
             
             logger.info('global n_training: %d' % len(train_dl_global))
