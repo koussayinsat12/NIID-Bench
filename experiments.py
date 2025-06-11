@@ -1362,6 +1362,93 @@ if __name__ == '__main__':
                         "round":cm_round
                         })
     
+    elif args.alg=='fedcgv1':
+        logger.info("Initializing nets")
+        
+        nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
+        global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
+        global_model = global_models[0]
+
+        global_para = global_model.state_dict()
+        if args.is_same_initial:
+            for net_id, net in nets.items():
+                net.load_state_dict(global_para)
+
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
+
+            arr = np.arange(args.n_parties)
+            np.random.shuffle(arr)
+            selected = arr[:int(args.n_parties * args.sample)]
+
+            global_para = global_model.state_dict()
+            if cm_round == 0:
+                if args.is_same_initial:
+                    for idx in selected:
+                        nets[idx].load_state_dict(global_para)
+            else:
+                for idx in selected:
+                    nets[idx].load_state_dict(global_para)
+
+            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+
+            cld_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]
+            n_par = len(get_mdl_params([global_model], exclude_bn=False, device=args.device)[0])
+
+            A = 0
+            b = 0
+            
+    
+            R_diag_list, R_rows_list = [], []
+            
+            for idx in range(len(selected)):
+                
+                #### get model params
+                curr_model_par = get_mdl_params([nets[idx]], exclude_bn=False, n_par=n_par, device=args.device)[0]
+                
+                ### calculate drfit
+                R_diag, R_rows = build_local_drift_matrix(curr_model_par, cld_model_params, band=4, rho=0.3)
+                R_sparse = build_sparse_R_matrix(R_diag, R_rows, d_size=n_par)
+                
+                R_diag_list.append(R_diag)
+                R_rows_list.append(R_rows)
+                
+                ### calculate b
+                b += apply_A_sparse(R_sparse, curr_model_par)
+                
+            ### get model parameters
+            cld_model_params = conjugate_gradient_sparse(R_diag_list=R_diag_list, R_rows_list=R_rows_list,b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
+            
+            global_model = set_client_from_params(mdl=global_model, params=cld_model_params, exclude_bn=False, device=args.device)
+            
+            
+            logger.info('global n_training: %d' % len(train_dl_global))
+            logger.info('global n_test: %d' % len(test_dl_global))
+
+            global_model.to(device)
+            train_acc = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
+
+
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            
+            
+            wandb.log({
+                        "Train Accuracy": train_acc,
+                        "Test Accuracy": test_acc,
+                        "round":cm_round
+                        })
+    
+    
+    
+    
+    
+    
+    
+    
+    
     
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
