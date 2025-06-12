@@ -65,6 +65,8 @@ def get_args():
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
+    parser.add_argument('--rho_fedcg', type=float, default=1, help='contralable parameter for fedcgv1')
+    parser.add_argument('--scaling', type=bool, default=True, help='contralable parameter for fednova')
     args = parser.parse_args()
     return args
 
@@ -1333,10 +1335,10 @@ if __name__ == '__main__':
                 drift_norm = torch.abs(cld_model_params - curr_model_par) + 1e-6
                 
                 ### calculate b
-                b += drift_norm * curr_model_par
+                b += (drift_norm / torch.max(drift_norm)) * curr_model_par
                 
                 ### calculate A
-                A += drift_norm
+                A += (drift_norm / torch.max(drift_norm))
                 
             ### get model parameters
             cld_model_params = conjugate_gradient(A=A, b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
@@ -1408,8 +1410,8 @@ if __name__ == '__main__':
                 curr_model_par = get_mdl_params([nets[idx]], exclude_bn=False, n_par=n_par, device=args.device)[0]
                 
                 ### calculate drfit
-                R_diag, R_rows = build_local_drift_matrix(curr_model_par, cld_model_params, band=4, rho=0.3)
-                R_sparse = build_sparse_R_matrix(R_diag, R_rows, d_size=n_par)
+                R_diag, R_rows = build_local_drift_matrix(curr_model_par, cld_model_params, band=10, rho=args.rho_fedcg)
+                R_sparse = build_sparse_R_matrix(R_diag, R_rows, d_size=n_par, device=args.device)
                 
                 R_diag_list.append(R_diag)
                 R_rows_list.append(R_rows)
@@ -1419,6 +1421,7 @@ if __name__ == '__main__':
                 
             ### get model parameters
             cld_model_params = conjugate_gradient_sparse(R_diag_list=R_diag_list, R_rows_list=R_rows_list,b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
+            #cld_model_params = conjugate_gradient_adam_style(R_diag_list=R_diag_list, R_rows_list=R_rows_list,b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
             
             global_model = set_client_from_params(mdl=global_model, params=cld_model_params, exclude_bn=False, device=args.device)
             
@@ -1440,15 +1443,6 @@ if __name__ == '__main__':
                         "Test Accuracy": test_acc,
                         "round":cm_round
                         })
-    
-    
-    
-    
-    
-    
-    
-    
-    
     
     elif args.alg == 'local_training':
         logger.info("Initializing nets")

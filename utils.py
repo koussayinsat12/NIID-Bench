@@ -985,12 +985,11 @@ def build_local_drift_matrix(w_i, w_bar, band=4, rho=0.3, eps=1e-12):
     R_diag = torch.sqrt(d) + 1e-6
     d_size = d.size(0)
 
-    # Vectorized indices for banded upper triangle (i < j and j - i <= band)
     row_indices = []
     col_indices = []
 
     for offset in range(1, band + 1):
-        i = torch.arange(d_size - offset)
+        i = torch.arange(d_size - offset, device=w_i.device)
         j = i + offset
         row_indices.append(i)
         col_indices.append(j)
@@ -1009,49 +1008,26 @@ def build_local_drift_matrix(w_i, w_bar, band=4, rho=0.3, eps=1e-12):
     min_d = torch.min(d_i, d_j)
 
     weights = rho * torch.sqrt(min_d) * c
-
-    # Row-wise max allowed weight (for normalization)
     max_allowed = 0.9 * R_diag[row_indices]
-
-    # Normalize per row group (need to sum per unique row)
     abs_weights = torch.abs(weights)
 
-    # Compute sum of weights per row (efficiently)
     sum_abs = torch.zeros_like(R_diag)
     sum_abs.index_add_(0, row_indices, abs_weights)
-
-    # Compute scaling factors per row
     scale = torch.clamp(max_allowed / (sum_abs[row_indices] + eps), max=1.0)
-
-    # Apply scaling
     weights = weights * scale
-
-    # Store in dictionary (optionally: you can return as COO-format sparse tensor instead)
+    
+    
     R_rows = defaultdict(list)
     for r, c, v in zip(row_indices.tolist(), col_indices.tolist(), weights.tolist()):
         R_rows[r].append((c, v))
 
     return R_diag, R_rows
 
-
-def build_sparse_R_matrix(R_diag, R_rows, d_size):
-    """
-    Construct sparse upper-triangular matrix R_i in COO format from R_diag and R_rows.
-
-    Args:
-        R_diag (torch.Tensor): Diagonal entries, shape [d].
-        R_rows (dict): Sparse off-diagonal entries, format {row: [(col, val), ...]}.
-        d_size (int): Dimension of the vector.
-
-    Returns:
-        R (torch.sparse_coo_tensor): Sparse matrix R_i of shape [d, d].
-    """
-    # Diagonal entries
-    row_idx = torch.arange(d_size)
-    col_idx = torch.arange(d_size)
+def build_sparse_R_matrix(R_diag, R_rows, d_size, device):
+    row_idx = torch.arange(d_size, device=device)
+    col_idx = torch.arange(d_size, device=device)
     values = R_diag
 
-    # Off-diagonal entries
     off_row = []
     off_col = []
     off_val = []
@@ -1063,86 +1039,54 @@ def build_sparse_R_matrix(R_diag, R_rows, d_size):
             off_val.append(v)
 
     if off_val:
-        row_idx = torch.cat([row_idx, torch.tensor(off_row, dtype=torch.long)])
-        col_idx = torch.cat([col_idx, torch.tensor(off_col, dtype=torch.long)])
-        values = torch.cat([values, torch.tensor(off_val, dtype=torch.float32)])
+        row_idx = torch.cat([row_idx, torch.tensor(off_row, dtype=torch.long, device=device)])
+        col_idx = torch.cat([col_idx, torch.tensor(off_col, dtype=torch.long, device=device)])
+        values = torch.cat([values, torch.tensor(off_val, dtype=torch.float32, device=device)])
 
     indices = torch.stack([row_idx, col_idx])
-    R = torch.sparse_coo_tensor(indices, values, (d_size, d_size))
+    R = torch.sparse_coo_tensor(indices, values, (d_size, d_size), device=device)
     return R.coalesce()
 
-
 def apply_R_sparse(R, x):
-    """
-    Compute y = R * x using sparse matrix.
-
-    Args:
-        R (torch.sparse_coo_tensor): Sparse matrix R_i.
-        x (torch.Tensor): Vector x.
-
-    Returns:
-        y (torch.Tensor): Result of R * x.
-    """
     return torch.sparse.mm(R, x.unsqueeze(1)).squeeze(1)
 
 def apply_R_transpose_sparse(R, x):
-    """
-    Compute y = R^T * x using sparse matrix.
-
-    Args:
-        R (torch.sparse_coo_tensor): Sparse matrix R_i.
-        x (torch.Tensor): Vector x.
-
-    Returns:
-        y (torch.Tensor): Result of R^T * x.
-    """
     return torch.sparse.mm(R.transpose(0, 1), x.unsqueeze(1)).squeeze(1)
 
 def apply_A_sparse(R, x):
-    """
-    Compute y = A * x = R^T * (R * x) using sparse matrix.
-
-    Args:
-        R (torch.sparse_coo_tensor): Sparse matrix R_i.
-        x (torch.Tensor): Vector x.
-
-    Returns:
-        y (torch.Tensor): Result of A * x.
-    """
     Rx = apply_R_sparse(R, x)
     return apply_R_transpose_sparse(R, Rx)
 
 def apply_A_from_R_list(R_diag_list, R_rows_list, x):
-    
+    device = x.device
     d_size = x.size(0)
-    y = torch.zeros(d_size, dtype=torch.float32)
+    y = torch.zeros(d_size, dtype=x.dtype, device=device)
 
     for R_diag, R_rows in zip(R_diag_list, R_rows_list):
-        R = build_sparse_R_matrix(R_diag, R_rows, d_size)
-
-        # Compute R_i x
-        Rx = torch.sparse.mm(R, x.unsqueeze(1)).squeeze(1)  # shape [d]
-
-        # Compute R_i^T (R_i x)
-        RtRx = torch.sparse.mm(R.transpose(0,1), Rx.unsqueeze(1)).squeeze(1)  # shape [d]
-
-        # Accumulate result
+        R = build_sparse_R_matrix(R_diag, R_rows, d_size, device=device)
+        Rx = apply_R_sparse(R, x)
+        RtRx = apply_R_transpose_sparse(R, Rx)
         y += RtRx
 
     return y
 
 def conjugate_gradient_sparse(R_diag_list, R_rows_list, b, x0, tol=1e-6, max_iter=50):
     x = x0
-    r = b - apply_A_from_R_list(R_diag_list, R_rows_list, x=x0)
-    d = r
+    r = b - apply_A_from_R_list(R_diag_list, R_rows_list, x0)
+    d = r.clone()
+
     for _ in range(max_iter):
-        Ad = apply_A_from_R_list(R_diag_list, R_rows_list, x=d)
-        alpha = torch.dot(r, r) / torch.dot(d, Ad)
+        Ad = apply_A_from_R_list(R_diag_list, R_rows_list, d)
+        r_dot = torch.dot(r, r)
+        alpha = r_dot / (torch.dot(d, Ad) + 1e-12)
         x = x + alpha * d
         r_new = r - alpha * Ad
+
         if torch.norm(r_new) < tol:
             break
-        beta = torch.dot(r_new, r_new) / torch.dot(r, r)
+
+        beta = torch.dot(r_new, r_new) / (r_dot + 1e-12)
         d = r_new + beta * d
         r = r_new
+
     return x
