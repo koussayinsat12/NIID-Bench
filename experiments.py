@@ -24,6 +24,7 @@ from model import *
 from utils import *
 from vggmodel import *
 from resnetcifar import *
+from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -66,7 +67,10 @@ def get_args():
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
     parser.add_argument('--rho_fedcg', type=float, default=1, help='contralable parameter for fedcgv1')
-    parser.add_argument('--scaling', type=bool, default=True, help='contralable parameter for fednova')
+    parser.add_argument('--scaling', type=bool, default=True, help='contralable parameter for fedcgv1')
+    parser.add_argument('--server_opt', type=str, default='adam', help='server optimizer for fedcgv1opt')
+    parser.add_argument('--server_lr', type=float, default=1, help='server lr for fedcgv1opt')
+    parser.add_argument('--server_momentum', type=float, default=0, help='server momentumo for fedcgv1opt')
     args = parser.parse_args()
     return args
 
@@ -804,6 +808,7 @@ def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./da
 
     return net_dataidx_map
 
+        
 if __name__ == '__main__':
     # torch.set_printoptions(profile="full")
     args = get_args()
@@ -1443,6 +1448,129 @@ if __name__ == '__main__':
                         "Test Accuracy": test_acc,
                         "round":cm_round
                         })
+    
+    elif args.alg=='fedcgv1opt':
+        logger.info("Initializing nets")
+        
+        nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
+        global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 0, 1, args)
+        global_model = global_models[0]
+
+        global_para = global_model.state_dict()
+        if args.is_same_initial:
+            for net_id, net in nets.items():
+                net.load_state_dict(global_para)
+                
+                
+        if args.server_opt == 'sgd':
+            server_optimizer = optim.SGD(params=global_model.parameters(), lr=args.server_lr, momentum=args.server_momentum)
+        elif args.server_opt == 'adam':
+            server_optimizer = optim.Adam(params=global_model.parameters(), lr=args.server_lr, betas=(0.9, 0.99), eps=10**(-1))
+        elif args.server_opt == 'adagrad':
+            server_optimizer = optim.Adagrad(params=global_model.parameters(), lr=args.server_lr, eps=10**(-2))
+
+        for cm_round in range(args.comm_round):
+            logger.info("in comm round:" + str(cm_round))
+
+            arr = np.arange(args.n_parties)
+            np.random.shuffle(arr)
+            selected = arr[:int(args.n_parties * args.sample)]
+
+            global_para = global_model.state_dict()
+            if cm_round == 0:
+                if args.is_same_initial:
+                    for idx in selected:
+                        nets[idx].load_state_dict(global_para)
+            else:
+                for idx in selected:
+                    nets[idx].load_state_dict(global_para)
+
+            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
+
+            cld_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]
+            n_par = len(get_mdl_params([global_model], exclude_bn=False, device=args.device)[0])
+
+            A = 0
+            b = 0
+            
+    
+            R_diag_list, R_rows_list = [], []
+            
+            for idx in range(len(selected)):
+                
+                #### get model params
+                curr_model_par = get_mdl_params([nets[idx]], exclude_bn=False, n_par=n_par, device=args.device)[0]
+                
+                ### calculate drfit
+                R_diag, R_rows = build_local_drift_matrix(curr_model_par, cld_model_params, band=10, rho=args.rho_fedcg)
+                R_sparse = build_sparse_R_matrix(R_diag, R_rows, d_size=n_par, device=args.device)
+                
+                R_diag_list.append(R_diag)
+                R_rows_list.append(R_rows)
+                
+                ### calculate b
+                b += apply_A_sparse(R_sparse, curr_model_par)
+                
+            ### get model parameters
+            cld_model_params = conjugate_gradient_sparse(
+                R_diag_list=R_diag_list, 
+                R_rows_list=R_rows_list, 
+                b=b, 
+                x0=cld_model_params, 
+                tol=1e-6, 
+                max_iter=50
+            )
+
+            # cld_model_params is a flat 1D tensor; reshape and load into gradient dict
+            cld_gradients_dict = copy.deepcopy(global_model.state_dict())
+
+            idx = 0
+            for name, param in global_model.state_dict().items():
+                weights = param.data
+                length = weights.numel()
+                try:
+                    cld_gradients_dict[name].data.copy_(
+                        cld_model_params[idx:idx+length].reshape(weights.shape).to(device=device, dtype=weights.dtype)
+                    )
+                    idx += length
+                except Exception as e:
+                    raise ValueError(f"Error setting parameter {name}: {str(e)}")
+
+            # Set gradients for backprop (negated if required by algorithm)
+            for n, p in global_model.named_parameters():
+                if p.requires_grad:
+                    p.grad = -1.0 * cld_gradients_dict[n].data
+
+            # Perform optimization step
+            server_optimizer.step()
+
+            # Load BatchNorm stats (running mean, var, etc.) back into global_model
+            bn_layers = OrderedDict(
+                {k: v for k, v in cld_gradients_dict.items() if "running" in k or "num_batches_tracked" in k}
+            )
+            global_model.load_state_dict(bn_layers, strict=False)
+         
+            
+            
+            logger.info('global n_training: %d' % len(train_dl_global))
+            logger.info('global n_test: %d' % len(test_dl_global))
+
+            global_model.to(device)
+            train_acc = compute_accuracy(global_model, train_dl_global, device=device)
+            test_acc, conf_matrix = compute_accuracy(global_model, test_dl_global, get_confusion_matrix=True, device=device)
+
+
+            logger.info('>> Global Model Train accuracy: %f' % train_acc)
+            logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            
+            
+            wandb.log({
+                        "Train Accuracy": train_acc,
+                        "Test Accuracy": test_acc,
+                        "round":cm_round
+                        })
+    
     
     elif args.alg == 'local_training':
         logger.info("Initializing nets")
