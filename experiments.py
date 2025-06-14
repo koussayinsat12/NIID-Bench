@@ -794,6 +794,196 @@ def local_train_net_moon(nets, selected, args, net_dataidx_map, test_dl=None, gl
 
 
 
+def train_net_fedcgv1opt(
+    net_id,
+    net,
+    hist_i,
+    global_model_params,
+    local_update_last,
+    global_update_last,
+    train_dataloader,
+    test_dataloader,
+    epochs, 
+    lr,
+    alpha,
+    args_optimizer,
+    device="cpu"
+    ):
+    logger.info('Training network %s' % str(net_id))
+
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+    logger.info('>> Pre-Training Training accuracy: {}'.format(train_acc))
+    logger.info('>> Pre-Training Test accuracy: {}'.format(test_acc))
+
+    if args_optimizer == 'adam':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
+    elif args_optimizer == 'amsgrad':
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
+                               amsgrad=True)
+    elif args_optimizer == 'sgd':
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=args.rho, weight_decay=args.reg)
+    
+    loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
+
+    cnt = 0
+    if type(train_dataloader) == type([1]):
+        pass
+    else:
+        train_dataloader = [train_dataloader]
+
+    #writer = SummaryWriter()
+    state_update_diff = -local_update_last+ global_update_last
+    
+    n_trn = len(train_dataloader[0].dataset)
+
+   
+    
+    for epoch in range(epochs):
+        epoch_loss_collector = []
+        for tmp in train_dataloader:
+            for batch_idx, (x, target) in enumerate(tmp):
+                x, target = x.to(device), target.to(device)
+
+                optimizer.zero_grad()
+                x.requires_grad = True
+                target.requires_grad = False
+                target = target.long()
+
+                out = net(x)
+                
+                loss_f_i = loss_fn(out, target.reshape(-1).long())
+                loss_f_i = loss_f_i / list(target.size())[0]
+                
+                local_parameter = None
+                for name, param in net.state_dict().items():
+                    if local_parameter is None:
+                        local_parameter = param.reshape(-1)
+                    else:
+                        local_parameter = torch.cat((local_parameter, param.reshape(-1)), dim=0)
+                                
+                loss_cp = alpha/2 * torch.sum((local_parameter - (global_model_params - hist_i))**2)
+                loss_cg = torch.sum(local_parameter * state_update_diff)
+                
+                #logger.info(f"loss_f_i: {loss_f_i:.4f}, loss_cp: {loss_cp:.4f}, loss_cg: {loss_cg:.4f}")
+                
+                loss = loss_f_i + loss_cg  + loss_cp
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters=net.parameters(), max_norm=10)
+                optimizer.step()
+
+                cnt += 1
+                epoch_loss_collector.append(loss.item() * list(target.size())[0])
+
+        epoch_loss = sum(epoch_loss_collector) / n_trn
+        logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+
+        #train_acc = compute_accuracy(net, train_dataloader, device=device)
+        #test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+        #writer.add_scalar('Accuracy/train', train_acc, epoch)
+        #writer.add_scalar('Accuracy/test', test_acc, epoch)
+
+        # if epoch % 10 == 0:
+        #     logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+        #     train_acc = compute_accuracy(net, train_dataloader, device=device)
+        #     test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+        #
+        #     logger.info('>> Training accuracy: %f' % train_acc)
+        #     logger.info('>> Test accuracy: %f' % test_acc)
+
+    train_acc = compute_accuracy(net, train_dataloader, device=device)
+    test_acc, conf_matrix = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
+
+    logger.info('>> Training accuracy: %f' % train_acc)
+    logger.info('>> Test accuracy: %f' % test_acc)
+
+    net.to('cpu')
+    logger.info(' ** Training complete **')
+    return train_acc, test_acc
+
+
+
+
+
+
+
+
+def local_train_net_fedcgv1opt(nets, 
+                               selected,
+                               global_model_params,
+                               state_gadient_diffs,
+                               parameter_drifts,
+                               weight_list,
+                               alphas,
+                               args, 
+                               net_dataidx_map, 
+                               test_dl = None, 
+                               device="cpu"):
+    avg_acc = 0.0
+    
+    for net_id, net in nets.items():
+        if net_id not in selected:
+            continue
+        dataidxs = net_dataidx_map[net_id]
+        
+        # retrive local gradient drift delta theta_i and global gradient drift delta theta
+        local_update_last = state_gadient_diffs[net_id] # delta theta_i
+            
+            # normalize global gradient drift by the weight of the client
+        global_update_last = state_gadient_diffs[-1]/ weight_list[net_id] #delta theta
+            
+            # retrieve local drift of the selected client 
+        hist_i = parameter_drifts[net_id] # h_i
+        
+        alpha = alphas[net_id] # alpha_i
+        
+        logger.info("Training network %s. n_training: %d" % (str(net_id), len(dataidxs)))
+        # move the model to cuda device:
+        net.to(device)
+
+        noise_level = args.noise
+        if net_id == args.n_parties - 1:
+            noise_level = 0
+
+        if args.noise_type == 'space':
+            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, net_id, args.n_parties-1)
+        else:
+            noise_level = args.noise / (args.n_parties - 1) * net_id
+            train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
+        train_dl_global, test_dl_global, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32)
+        n_epoch = args.epochs
+
+        trainacc, testacc = train_net_fedcgv1opt(net_id=net_id, 
+                                      net=net,
+                                      hist_i=hist_i,
+                                      global_model_params=global_model_params,
+                                      local_update_last=local_update_last,
+                                      global_update_last=global_update_last,
+                                      train_dataloader=train_dl_local, 
+                                      test_dataloader= test_dl, 
+                                      epochs=n_epoch, 
+                                      lr=args.lr,
+                                      alpha=alpha,
+                                      args_optimizer=args.optimizer, 
+                                      device=device)
+        
+        logger.info("net %d final test acc %f" % (net_id, testacc))
+        avg_acc += testacc
+        # saving the trained models here
+        # save_model(net, net_id, args)
+        # else:
+        #     load_model(net, net_id, device=device)
+    avg_acc /= len(selected)
+    if args.alg == 'local_training':
+        logger.info("avg test acc %f" % avg_acc)
+
+    nets_list = list(nets.values())
+    return nets_list
+
+
 def get_partition_dict(dataset, partition, n_parties, init_seed=0, datadir='./data', logdir='./logs', beta=0.5):
     seed = init_seed
     np.random.seed(seed)
@@ -1456,6 +1646,33 @@ if __name__ == '__main__':
         if args.is_same_initial:
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
+        
+
+                
+        betas = {}
+        for i in range(args.n_parties):
+            
+            n_iter_per_epoch  = np.ceil(len(net_dataidx_map[i].dataset)/args.batch_size)
+            n_minibatch = (args.epochs*n_iter_per_epoch).astype(np.int64)
+            betas[i] = 1/ n_minibatch/ args.lr
+
+        # initialize global model and local models
+      
+        # get the number of parameters in the model
+        n_par = len(get_mdl_params([global_model], exclude_bn=False, device=args.device)[0])
+        
+        # initialize parameter drifts for each client
+        parameter_drifts = torch.zeros((args.n_parties, n_par), dtype=torch.float32, device=device)
+        state_gadient_diffs = torch.zeros((args.n_parties+1, n_par), dtype=torch.float32, device=device)
+        # normalize the weights of each client based on the number of samples given to each client
+        weight_list = np.asarray([len(net_dataidx_map[i].dataset) for i in range(args.n_parties)])
+        weight_list = weight_list / np.sum(weight_list) * args.n_parties
+        weight_list = torch.tensor(weight_list, dtype=torch.float32, device=args.device)
+        
+        
+        #initialize alpha for each client
+        alphas = {net_id : float(args.alpha_coef) / weight_list[net_id] for net_id in range(args.n_parties)}
+                
 
         for cm_round in range(args.comm_round):
             logger.info("in comm round:" + str(cm_round))
@@ -1465,6 +1682,9 @@ if __name__ == '__main__':
             selected = arr[:int(args.n_parties * args.sample)]
 
             global_para = global_model.state_dict()
+            
+            global_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]
+            
             if cm_round == 0:
                 if args.is_same_initial:
                     for idx in selected:
@@ -1473,7 +1693,17 @@ if __name__ == '__main__':
                 for idx in selected:
                     nets[idx].load_state_dict(global_para)
 
-            local_train_net(nets, selected, args, net_dataidx_map, test_dl = test_dl_global, device=device)
+            local_train_net_fedcgv1opt(nets=nets, 
+                            selected=selected,
+                            global_model_params=global_model_params,
+                            state_gadient_diffs=state_gadient_diffs,
+                            parameter_drifts=parameter_drifts,
+                            weight_list=weight_list,
+                            alphas=alphas,
+                            args=args, 
+                            net_dataidx_map=net_dataidx_map, 
+                            test_dl = test_dl_global, 
+                            device=args.device)
             # local_train_net(nets, args, net_dataidx_map, local_split=False, device=device)
 
             cld_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]
@@ -1517,6 +1747,32 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
             
+            delta_g_sum = torch.zeros(n_par, dtype=torch.float32, device=args.device)
+            
+            local_update_last = state_gadient_diffs[net_id] # delta theta_i
+            global_update_last = state_gadient_diffs[-1]/ weight_list[net_id] #delta t
+            
+            
+            
+            for net_id, net in nets.items():
+                if net_id not in selected:
+                    continue
+            
+                curr_model_par = get_mdl_params([net], exclude_bn=False , n_par=n_par, device=args.device)[0]
+                
+                #calculate local gradient drift
+                delta_param_curr = curr_model_par-cld_model_params # delta theta_i = theta_i - theta
+                parameter_drifts[net_id] += delta_param_curr #hi = hi + delta theta_i
+               
+                # update local gradient drift
+                state_g = local_update_last - global_update_last + betas[net_id] * (-delta_param_curr) 
+                delta_g_cur = (state_g - state_gadient_diffs[net_id])*weight_list[net_id] 
+                delta_g_sum += delta_g_cur
+                
+                state_gadient_diffs[net_id] = state_g
+            delta_g_cur = 1 / args.n_parties * delta_g_sum  
+            state_gadient_diffs[-1] += delta_g_cur  
+           
             
             wandb.log({
                         "Train Accuracy": train_acc,
