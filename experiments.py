@@ -1568,6 +1568,7 @@ if __name__ == '__main__':
                 net.load_state_dict(global_para)
 
         for cm_round in range(args.comm_round):
+            
             logger.info("in comm round:" + str(cm_round))
 
             arr = np.arange(args.n_parties)
@@ -1594,6 +1595,7 @@ if __name__ == '__main__':
             
     
             R_diag_list, R_rows_list = [], []
+            x0 = cld_model_params
             
             for idx in range(len(selected)):
                 
@@ -1610,7 +1612,23 @@ if __name__ == '__main__':
                 ### calculate b
                 b += apply_A_sparse(R_sparse, curr_model_par)
                 
-            ### get model parameters
+                ### get model parameters
+                if cm_round == 0:
+                    total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
+                    fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
+
+                    for idx in range(len(selected)):
+                        net_para = nets[selected[idx]].cpu().state_dict()
+                        if idx == 0:
+                            for key in net_para:
+                                global_para[key] = net_para[key] * fed_avg_freqs[idx]
+                        else:
+                            for key in net_para:
+                                global_para[key] += net_para[key] * fed_avg_freqs[idx]
+                    global_model.load_state_dict(global_para)
+                    
+                    cld_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]        
+            
             cld_model_params = conjugate_gradient_sparse(R_diag_list=R_diag_list, R_rows_list=R_rows_list,b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
             #cld_model_params = conjugate_gradient_adam_style(R_diag_list=R_diag_list, R_rows_list=R_rows_list,b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
             
@@ -1647,8 +1665,7 @@ if __name__ == '__main__':
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
         
-
-                
+       
         betas = {}
         for i in range(args.n_parties):
             
@@ -1672,7 +1689,7 @@ if __name__ == '__main__':
         
         #initialize alpha for each client
         alphas = {net_id : float(0.01) / weight_list[net_id] for net_id in range(args.n_parties)}
-                
+
 
         for cm_round in range(args.comm_round):
             logger.info("in comm round:" + str(cm_round))
@@ -1680,7 +1697,10 @@ if __name__ == '__main__':
             arr = np.arange(args.n_parties)
             np.random.shuffle(arr)
             selected = arr[:int(args.n_parties * args.sample)]
-
+            
+            total_data_points = sum([len(net_dataidx_map[r]) for r in selected])
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in selected]
+    
             global_para = global_model.state_dict()
             
             global_model_params = get_mdl_params([global_model], exclude_bn=False, device=args.device)[0]
