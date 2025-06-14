@@ -1652,7 +1652,7 @@ if __name__ == '__main__':
         betas = {}
         for i in range(args.n_parties):
             
-            n_iter_per_epoch  = np.ceil(len(net_dataidx_map[i].dataset)/args.batch_size)
+            n_iter_per_epoch  = np.ceil(len(net_dataidx_map[i])/args.batch_size)
             n_minibatch = (args.epochs*n_iter_per_epoch).astype(np.int64)
             betas[i] = 1/ n_minibatch/ args.lr
 
@@ -1665,13 +1665,13 @@ if __name__ == '__main__':
         parameter_drifts = torch.zeros((args.n_parties, n_par), dtype=torch.float32, device=device)
         state_gadient_diffs = torch.zeros((args.n_parties+1, n_par), dtype=torch.float32, device=device)
         # normalize the weights of each client based on the number of samples given to each client
-        weight_list = np.asarray([len(net_dataidx_map[i].dataset) for i in range(args.n_parties)])
+        weight_list = np.asarray([len(net_dataidx_map[i]) for i in range(args.n_parties)])
         weight_list = weight_list / np.sum(weight_list) * args.n_parties
         weight_list = torch.tensor(weight_list, dtype=torch.float32, device=args.device)
         
         
         #initialize alpha for each client
-        alphas = {net_id : float(args.alpha_coef) / weight_list[net_id] for net_id in range(args.n_parties)}
+        alphas = {net_id : float(0.01) / weight_list[net_id] for net_id in range(args.n_parties)}
                 
 
         for cm_round in range(args.comm_round):
