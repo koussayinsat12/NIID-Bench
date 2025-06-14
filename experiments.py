@@ -67,10 +67,6 @@ def get_args():
     parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
     parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
     parser.add_argument('--rho_fedcg', type=float, default=1, help='contralable parameter for fedcgv1')
-    parser.add_argument('--scaling', type=bool, default=True, help='contralable parameter for fedcgv1')
-    parser.add_argument('--server_opt', type=str, default='adam', help='server optimizer for fedcgv1opt')
-    parser.add_argument('--server_lr', type=float, default=1, help='server lr for fedcgv1opt')
-    parser.add_argument('--server_momentum', type=float, default=0, help='server momentumo for fedcgv1opt')
     args = parser.parse_args()
     return args
 
@@ -1460,14 +1456,6 @@ if __name__ == '__main__':
         if args.is_same_initial:
             for net_id, net in nets.items():
                 net.load_state_dict(global_para)
-                
-                
-        if args.server_opt == 'sgd':
-            server_optimizer = optim.SGD(params=global_model.parameters(), lr=args.server_lr, momentum=args.server_momentum)
-        elif args.server_opt == 'adam':
-            server_optimizer = optim.Adam(params=global_model.parameters(), lr=args.server_lr, betas=(0.9, 0.99), eps=10**(-1))
-        elif args.server_opt == 'adagrad':
-            server_optimizer = optim.Adagrad(params=global_model.parameters(), lr=args.server_lr, eps=10**(-2))
 
         for cm_round in range(args.comm_round):
             logger.info("in comm round:" + str(cm_round))
@@ -1513,44 +1501,9 @@ if __name__ == '__main__':
                 b += apply_A_sparse(R_sparse, curr_model_par)
                 
             ### get model parameters
-            cld_model_params = conjugate_gradient_sparse(
-                R_diag_list=R_diag_list, 
-                R_rows_list=R_rows_list, 
-                b=b, 
-                x0=cld_model_params, 
-                tol=1e-6, 
-                max_iter=50
-            )
-
-            # cld_model_params is a flat 1D tensor; reshape and load into gradient dict
-            cld_gradients_dict = copy.deepcopy(global_model.state_dict())
-
-            idx = 0
-            for name, param in global_model.state_dict().items():
-                weights = param.data
-                length = weights.numel()
-                try:
-                    cld_gradients_dict[name].data.copy_(
-                        cld_model_params[idx:idx+length].reshape(weights.shape).to(device=device, dtype=weights.dtype)
-                    )
-                    idx += length
-                except Exception as e:
-                    raise ValueError(f"Error setting parameter {name}: {str(e)}")
-
-            # Set gradients for backprop (negated if required by algorithm)
-            for n, p in global_model.named_parameters():
-                if p.requires_grad:
-                    p.grad = -1.0 * cld_gradients_dict[n].data
-
-            # Perform optimization step
-            server_optimizer.step()
-
-            # Load BatchNorm stats (running mean, var, etc.) back into global_model
-            bn_layers = OrderedDict(
-                {k: v for k, v in cld_gradients_dict.items() if "running" in k or "num_batches_tracked" in k}
-            )
-            global_model.load_state_dict(bn_layers, strict=False)
-         
+            cld_model_params = conjugate_gradient_sparse(R_diag_list=R_diag_list, R_rows_list=R_rows_list,b=b, x0=cld_model_params, tol=1e-6, max_iter=50)
+            
+            global_model = set_client_from_params(mdl=global_model, params=cld_model_params, exclude_bn=False, device=args.device)
             
             
             logger.info('global n_training: %d' % len(train_dl_global))

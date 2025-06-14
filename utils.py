@@ -1008,14 +1008,6 @@ def build_local_drift_matrix(w_i, w_bar, band=4, rho=0.3, eps=1e-12):
     min_d = torch.min(d_i, d_j)
 
     weights = rho * torch.sqrt(min_d) * c
-    max_allowed = 0.9 * R_diag[row_indices]
-    abs_weights = torch.abs(weights)
-
-    sum_abs = torch.zeros_like(R_diag)
-    sum_abs.index_add_(0, row_indices, abs_weights)
-    scale = torch.clamp(max_allowed / (sum_abs[row_indices] + eps), max=1.0)
-    weights = weights * scale
-    
     
     R_rows = defaultdict(list)
     for r, c, v in zip(row_indices.tolist(), col_indices.tolist(), weights.tolist()):
