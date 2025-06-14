@@ -1595,7 +1595,6 @@ if __name__ == '__main__':
             
     
             R_diag_list, R_rows_list = [], []
-            x0 = cld_model_params
             
             for idx in range(len(selected)):
                 
